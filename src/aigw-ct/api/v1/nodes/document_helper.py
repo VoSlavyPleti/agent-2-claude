@@ -1,5 +1,6 @@
 import re
 import json
+from copy import deepcopy
 from io import BytesIO
 from typing import List
 from docx import Document
@@ -38,6 +39,51 @@ class DocumentProcessingHelpers:
                     if self._clear_text(text) in self._clear_text(cell.text):
                         return True
         return False
+
+    def _find_element_by_marker(self, all_elements, marker):
+        """
+        3-уровневый поиск маркера среди элементов документа.
+        Level 1: exact match через _clear_text (текущее поведение)
+        Level 2: normalized — нормализация пробелов и регистра
+        Level 3: word overlap — ≥70% слов маркера присутствуют в элементе
+        Возвращает элемент или None.
+        """
+        # Level 1: exact (через _clear_text — уже убирает спецсимволы)
+        for element, obj in all_elements:
+            if self._contains_text_forms(obj, marker):
+                return element
+
+        # Level 2: normalized — более мягкая очистка
+        norm_marker = re.sub(r'\s+', ' ', marker.lower().strip())
+        for element, obj in all_elements:
+            if isinstance(obj, Paragraph):
+                norm_text = re.sub(r'\s+', ' ', obj.text.lower().strip())
+                if norm_marker in norm_text:
+                    return element
+            elif isinstance(obj, Table):
+                for row in obj.rows:
+                    for cell in row.cells:
+                        norm_text = re.sub(r'\s+', ' ', cell.text.lower().strip())
+                        if norm_marker in norm_text:
+                            return element
+
+        # Level 3: word overlap ≥70%
+        words = [w for w in norm_marker.split() if len(w) > 2]
+        if not words:
+            return None
+        threshold = 0.7
+        for element, obj in all_elements:
+            text = ""
+            if isinstance(obj, Paragraph):
+                text = obj.text.lower()
+            elif isinstance(obj, Table):
+                text = " ".join(cell.text.lower() for row in obj.rows for cell in row.cells)
+            matched = sum(1 for w in words if w in text)
+            if matched / len(words) >= threshold:
+                logger.info(f"[precise_trim_forms] Fuzzy match: {matched}/{len(words)} words for marker '{marker[:50]}'")
+                return element
+
+        return None
 
     def _clear_text(self, text):
         """Очистка текста от всего кроме букв и цифр"""
@@ -149,50 +195,40 @@ class DocumentProcessingHelpers:
         и ВСЕ элементы после элемента с end_text.
         Сохраняет результат в новый файл.
 
+        Использует 3-уровневый поиск маркеров (exact → normalized → word overlap).
+
         :param start_text: текст начального маркера
         :param end_text: текст конечного маркера
         """
         doc = self.doc
         body = doc._element.body
 
-        # Находим начальный и конечный элементы
-        start_element = None
-        end_element = None
-
         # Запись разметки исходного документа
         original_section = doc.sections[0]
-        original_left_margin = original_section.left_margin  # Отступ слева
-        original_right_margin = original_section.right_margin  # Отступ справа
-        original_top_margin = original_section.top_margin  # Отступ сверху
-        original_bottom_margin = original_section.bottom_margin  # Отступ снизу
-        original_orientation = original_section.orientation  # Ориентация страницы
+        original_left_margin = original_section.left_margin
+        original_right_margin = original_section.right_margin
+        original_top_margin = original_section.top_margin
+        original_bottom_margin = original_section.bottom_margin
+        original_orientation = original_section.orientation
 
         # Ищем все элементы документа
         all_elements = []
         for element in body.iterchildren():
-            if element.tag.endswith('p'):  # Параграф
+            if element.tag.endswith('p'):
                 all_elements.append((element, Paragraph(element, doc)))
-            elif element.tag.endswith('tbl'):  # Таблица
+            elif element.tag.endswith('tbl'):
                 all_elements.append((element, Table(element, doc)))
 
-        # Ищем начальный маркер
-        for element, obj in all_elements:
-            if self._contains_text_forms(obj, start_text):
-                start_element = element
-                break
+        # Ищем начальный маркер (3-уровневый поиск)
+        start_element = self._find_element_by_marker(all_elements, start_text)
 
         if start_element is None:
             raise ValueError(f"Не удалось найти начальный маркер '{start_text}' в документе")
 
-        # Ищем конечный маркер (только после start_element)
-        start_found = False
-        for element, obj in all_elements:
-            if element == start_element:
-                start_found = True
-                continue
-            if start_found and self._contains_text_forms(obj, end_text):
-                end_element = element
-                break
+        # Ищем конечный маркер (только после start_element, 3-уровневый поиск)
+        start_idx = [e[0] for e in all_elements].index(start_element)
+        elements_after_start = all_elements[start_idx + 1:]
+        end_element = self._find_element_by_marker(elements_after_start, end_text)
 
         if end_element is None:
             raise ValueError(f"Не удалось найти конечный маркер '{end_text}' в документе")
@@ -232,11 +268,100 @@ class FormFiller:
     Заполнение форм данными.
 
     Улучшения:
+    - XML-level заполнение через lxml для максимального сохранения форматирования
+    - Расширенный паттерн плейсхолдеров (подчёркивания, точки, скобки)
     - Работа на уровне run'ов для сохранения форматирования (шрифт, размер, жирность)
     - Улучшенный поиск пропусков в соседних run'ах
     - Копирование стилей при заполнении таблиц
     - Лучшая обработка ошибок с логированием
     """
+
+    # Расширенный паттерн для различных типов плейсхолдеров
+    PLACEHOLDER_PATTERN = r'__{2,}|\[_+\]|<_+>|\.{5,}'
+
+    @staticmethod
+    def _fill_run_xml(paragraph, pattern, value):
+        """
+        XML-level заполнение: находит run с плейсхолдером, заменяет текст,
+        полностью сохраняет rPr (форматирование).
+        Возвращает True если замена произошла.
+        """
+        for run_elem in paragraph._element.findall(qn('w:r')):
+            t_elem = run_elem.find(qn('w:t'))
+            if t_elem is not None and t_elem.text and re.search(pattern, t_elem.text):
+                t_elem.text = re.sub(pattern, value, t_elem.text, count=1)
+                t_elem.set(qn('xml:space'), 'preserve')
+                return True
+        return False
+
+    @staticmethod
+    def _detect_field_codes(paragraph):
+        """Обнаруживает field codes (<w:fldChar> и <w:fldSimple>) в параграфе."""
+        fld_chars = paragraph._element.findall('.//' + qn('w:fldChar'))
+        fld_simples = paragraph._element.findall('.//' + qn('w:fldSimple'))
+        return len(fld_chars) > 0 or len(fld_simples) > 0
+
+    @staticmethod
+    def _fill_field_code(paragraph, value):
+        """
+        Заполняет MERGEFIELD/FORMTEXT: находит result run между fldChar separate и end.
+        Возвращает True если заполнение произошло.
+        """
+        runs = list(paragraph._element.findall(qn('w:r')))
+        in_result = False
+        for run in runs:
+            fld_char = run.find(qn('w:fldChar'))
+            if fld_char is not None:
+                fld_type = fld_char.get(qn('w:fldCharType'))
+                if fld_type == 'separate':
+                    in_result = True
+                elif fld_type == 'end':
+                    in_result = False
+            elif in_result:
+                t = run.find(qn('w:t'))
+                if t is not None:
+                    t.text = value
+                    t.set(qn('xml:space'), 'preserve')
+                    return True
+        return False
+
+    @staticmethod
+    def _get_real_cell_index(row, cell):
+        """Возвращает реальный индекс ячейки с учётом объединённых ячеек (gridSpan)."""
+        idx = 0
+        for c in row.cells:
+            if c._element == cell._element:
+                return idx
+            tc_pr = c._element.find(qn('w:tcPr'))
+            if tc_pr is not None:
+                grid_span = tc_pr.find(qn('w:gridSpan'))
+                if grid_span is not None:
+                    idx += int(grid_span.get(qn('w:val'), 1))
+                else:
+                    idx += 1
+            else:
+                idx += 1
+        return idx
+
+    @staticmethod
+    def _fill_table_cell_xml(cell, value, source_cell=None):
+        """
+        XML-level заполнение ячейки таблицы: добавляет run с текстом,
+        копируя rPr из source_cell если доступен.
+        """
+        p = cell.paragraphs[0]
+        if p.runs:
+            # Есть run — заполняем первый
+            p.runs[0].text = str(value)
+            return True
+
+        # Нет runs — создаём через XML с копированием стиля
+        new_run = p.add_run(str(value))
+        if source_cell and source_cell.paragraphs and source_cell.paragraphs[-1].runs:
+            source_rpr = source_cell.paragraphs[-1].runs[0]._element.find(qn('w:rPr'))
+            if source_rpr is not None:
+                new_run._element.insert(0, deepcopy(source_rpr))
+        return True
 
     @staticmethod
     def _clear_text(text):
@@ -290,7 +415,8 @@ class FormFiller:
         """
         Заполнение форм данными из сформированного в prepare_fill_forms словаря.
 
-        Работает на уровне run'ов для максимального сохранения форматирования.
+        Работает на уровне run'ов и XML для максимального сохранения форматирования.
+        Поддерживает field codes (MERGEFIELD, FORMTEXT) и расширенные плейсхолдеры.
         """
         doc = Document(BytesIO(bytes(row.bytes)))
         data = json.loads(row.dictionary)
@@ -298,18 +424,37 @@ class FormFiller:
         filled_count = 0
         failed_count = 0
 
+        # Предварительная проверка: есть ли field codes в документе
+        has_field_codes = any(
+            self._detect_field_codes(p) for p in doc.paragraphs
+        )
+        if has_field_codes:
+            logger.info("[FormFiller] Document contains field codes — will attempt field code filling")
+
         for key, (ptype, value) in data.items():
             try:
-                if ptype == "Текст до":
-                    filled = self._fill_text_before(doc, key, value, pattern)
-                elif ptype == "Текст после":
-                    filled = self._fill_text_after(doc, key, value, pattern)
-                elif ptype == "Таблица":
-                    filled = self._fill_table(doc, key, value)
-                elif ptype == "Гибрид":
-                    filled = self._fill_hybrid(doc, key, value, pattern)
-                else:
-                    filled = False
+                filled = False
+
+                # Приоритет 0: попробовать заполнить через field codes если они есть
+                if has_field_codes and not filled:
+                    for paragraph in doc.paragraphs:
+                        if self._detect_field_codes(paragraph):
+                            if self._clear_text(key) in self._clear_text(paragraph.text):
+                                filled = self._fill_field_code(paragraph, str(value))
+                                if filled:
+                                    logger.info(f"[FormFiller] Filled '{key[:30]}' via field code")
+                                    break
+
+                # Стандартное заполнение по типу
+                if not filled:
+                    if ptype == "Текст до":
+                        filled = self._fill_text_before(doc, key, value, pattern)
+                    elif ptype == "Текст после":
+                        filled = self._fill_text_after(doc, key, value, pattern)
+                    elif ptype == "Таблица":
+                        filled = self._fill_table(doc, key, value)
+                    elif ptype == "Гибрид":
+                        filled = self._fill_hybrid(doc, key, value, pattern)
 
                 if filled:
                     filled_count += 1
@@ -393,7 +538,7 @@ class FormFiller:
     def _fill_table(self, doc, key, value):
         """
         Тип 'Таблица': ключ в ячейке таблицы, значение в соседней (правой) ячейке.
-        Работает на уровне run'ов для сохранения форматирования.
+        XML-level копирование rPr для максимального сохранения форматирования.
         """
         for table in doc.tables:
             for row in table.rows:
@@ -408,65 +553,64 @@ class FormFiller:
                                 else:
                                     filling_cell.paragraphs[-1].add_run("\n" + value)
                             else:
-                                # Ячейка пустая — заполняем через run для сохранения стилей
-                                if filling_cell.paragraphs and filling_cell.paragraphs[0].runs:
-                                    filling_cell.paragraphs[0].runs[0].text = str(value)
-                                else:
-                                    new_run = filling_cell.paragraphs[0].add_run(str(value))
-                                    # Копируем стиль шрифта из ячейки-ключа
-                                    if cell.paragraphs and cell.paragraphs[-1].runs:
-                                        src_font = cell.paragraphs[-1].runs[0].font
-                                        new_run.font.name = src_font.name
-                                        new_run.font.size = src_font.size
+                                # Ячейка пустая — XML-level заполнение
+                                self._fill_table_cell_xml(filling_cell, value, source_cell=cell)
                             self.copy_styles(filling_cell.paragraphs[-1], cell.paragraphs[-1])
                             return True
                         except IndexError:
+                            # Нет соседней ячейки — добавляем в текущую
                             cell.add_paragraph()
-                            cell.paragraphs[-1].text = value
-                            self.copy_styles(cell.paragraphs[-1], cell.paragraphs[0])
+                            new_run = cell.paragraphs[-1].add_run(str(value))
+                            if cell.paragraphs[0].runs:
+                                source_rpr = cell.paragraphs[0].runs[0]._element.find(qn('w:rPr'))
+                                if source_rpr is not None:
+                                    new_run._element.insert(0, deepcopy(source_rpr))
                             return True
         return False
 
     def _fill_hybrid(self, doc, key, value, pattern):
         """
         Тип 'Гибрид': ключ и ____ в одной ячейке таблицы.
-        Работает на уровне run'ов.
+        Работает на уровне run'ов и XML для сохранения форматирования.
+        НЕ использует cell.text = (уничтожает форматирование).
         """
+        # Используем расширенный паттерн плейсхолдеров
+        extended_pattern = self.PLACEHOLDER_PATTERN + '|' + pattern if pattern != r'_+' else self.PLACEHOLDER_PATTERN
+
         for table in doc.tables:
             for row in table.rows:
                 for num, cell in enumerate(row.cells):
-                    if self._clear_text(key) in self._clear_text(cell.text) and re.findall(pattern, cell.text):
+                    if self._clear_text(key) in self._clear_text(cell.text) and re.findall(extended_pattern, cell.text):
                         # Подчёркивания в той же ячейке что и ключ
-                        # Ищем run с подчёркиваниями
-                        filled = False
+                        # Приоритет 1: XML-level через lxml
+                        for para in cell.paragraphs:
+                            if self._fill_run_xml(para, extended_pattern, f" {value}"):
+                                return True
+                        # Приоритет 2: через run.text
                         for para in cell.paragraphs:
                             for run in para.runs:
-                                if re.findall(pattern, run.text):
-                                    run.text = re.sub(pattern, f" {value}", run.text, count=1)
-                                    filled = True
-                                    break
-                            if filled:
-                                break
-                        if not filled:
-                            # Fallback: замена через cell.text (менее безопасно)
-                            cell.text = re.sub(pattern, f" {value}", cell.text, count=1)
-                        return True
-                    elif self._clear_text(key) in self._clear_text(cell.text) and not re.findall(pattern, cell.text):
+                                if re.findall(extended_pattern, run.text):
+                                    run.text = re.sub(extended_pattern, f" {value}", run.text, count=1)
+                                    return True
+                        # НЕ используем cell.text fallback — лучше warning чем потерять форматирование
+                        logger.warning(f"[FormFiller] Hybrid: found key '{key[:30]}' but couldn't fill via runs")
+                        return False
+                    elif self._clear_text(key) in self._clear_text(cell.text) and not re.findall(extended_pattern, cell.text):
                         try:
                             next_cell = row.cells[num + 1]
-                            # Ищем run с подчёркиваниями в соседней ячейке
-                            filled = False
+                            # Приоритет 1: XML-level
+                            for para in next_cell.paragraphs:
+                                if self._fill_run_xml(para, extended_pattern, f" {value}"):
+                                    return True
+                            # Приоритет 2: через run.text
                             for para in next_cell.paragraphs:
                                 for run in para.runs:
-                                    if re.findall(pattern, run.text):
-                                        run.text = re.sub(pattern, f" {value}", run.text, count=1)
-                                        filled = True
-                                        break
-                                if filled:
-                                    break
-                            if not filled:
-                                next_cell.text = re.sub(pattern, f" {value}", next_cell.text, count=1)
-                            return True
+                                    if re.findall(extended_pattern, run.text):
+                                        run.text = re.sub(extended_pattern, f" {value}", run.text, count=1)
+                                        return True
+                            # НЕ используем cell.text fallback
+                            logger.warning(f"[FormFiller] Hybrid: found key '{key[:30]}' in adjacent cell but couldn't fill via runs")
+                            return False
                         except IndexError:
                             continue
         return False

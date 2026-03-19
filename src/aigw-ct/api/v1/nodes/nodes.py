@@ -65,11 +65,12 @@ class NodesHelper:
             async with ecm as service:
                 for idx, row in df.iterrows():
                     result_log = await service.build_output(row, target)
+            logger.info(f"[save_data_in_ecm] Completed ({time.time() - start_time:.2f}s)")
+            return {"error_log": [{"node": "save_data_in_ecm", "status": "success"}]}
         except Exception as e:
             logger.error(f"[save_data_in_ecm] Error: {e}")
-            result_log = {"split_text_forms": 'Неуспешный запрос на сохранение документа'}
-        logger.info(f"[save_data_in_ecm] Completed ({time.time() - start_time:.2f}s)")
-        return {"error_log": result_log}
+            logger.info(f"[save_data_in_ecm] Completed ({time.time() - start_time:.2f}s)")
+            return {"error_log": [{"node": "save_data_in_ecm", "error": str(e)}]}
 
     @staticmethod
     async def ecm_retrieve_contents(state: Statement) -> dict:
@@ -113,7 +114,7 @@ class NodesHelper:
 
         except Exception as e:
             logger.error(f"[list_requirements] Error: {e}")
-            return {"list_requirements": f"Ошибка при извлечении требований: {e}"}
+            return {"all_requirements": "", "error_log": [{"node": "list_requirements", "error": str(e)}]}
 
     @staticmethod
     async def reducer_lst_req(state: Statement) -> dict:
@@ -142,7 +143,7 @@ class NodesHelper:
             }
         except Exception as e:
             logger.error(f"[reducer_lst_req] Error: {e}")
-            return {"reducer_list_req": f"Ошибка в сокращении списка требований: {e}"}
+            return {"reducer_list_req": "", "error_log": [{"node": "reducer_lst_req", "error": str(e)}]}
 
     @staticmethod
     async def split_text_forms(state: Statement) -> dict:
@@ -179,30 +180,27 @@ class NodesHelper:
                         process = DocumentProcessingHelpers(full_doc_bytes, split_phrase_fallback)
                         forms = process.precise_trim_docx()
                         if forms[0] == "failed":
-                            log = {"split_text_forms": "Ни основной, ни fallback маркер не сработали"}
                             logger.error(f"[split_text_forms] Both markers failed")
                             return {
                                 'text_with_requirements': document_text,
                                 "all_forms": [],
-                                "error_log": log,
+                                "error_log": [{"node": "split_text_forms", "error": "Ни основной, ни fallback маркер не сработали"}],
                                 "all_forms_text": ''
                             }
                         split_phrase = split_phrase_fallback
                     else:
-                        log = {"split_text_forms": 'Неверный маркер для разделения на текст и формы'}
                         return {
                             'text_with_requirements': document_text,
                             "all_forms": [],
-                            "error_log": log,
+                            "error_log": [{"node": "split_text_forms", "error": "Неверный маркер для разделения на текст и формы"}],
                             "all_forms_text": ''
                         }
             except Exception as e:
-                log = {"split_text_forms": f'Ошибка в разделении документа: {e}'}
                 logger.error(f"[split_text_forms] Error: {e}")
                 return {
                     'text_with_requirements': '',
                     "all_forms": [],
-                    "error_log": log,
+                    "error_log": [{"node": "split_text_forms", "error": f"Ошибка в разделении документа: {e}"}],
                     "all_forms_text": ''
                 }
 
@@ -222,15 +220,14 @@ class NodesHelper:
                 return {
                     'text_with_requirements': res_text,
                     "all_forms": divided_forms,
-                    "error_log": {"split_text_forms": "success"},
+                    "error_log": [{"node": "split_text_forms", "status": "success"}],
                     "all_forms_text": all_forms_text
                 }
             except Exception as e:
-                log = {"split_text_forms": f'Ошибка в извлечении текста: {e}'}
                 return {
                     'text_with_requirements': '',
                     "all_forms": [],
-                    "error_log": log,
+                    "error_log": [{"node": "split_text_forms", "error": f"Ошибка в извлечении текста: {e}"}],
                     "all_forms_text": ''
                 }
 
@@ -239,7 +236,7 @@ class NodesHelper:
             return {
                 'text_with_requirements': '',
                 "all_forms": full_doc_bytes,
-                "error_log": {"split_text_forms": "success"},
+                "error_log": [{"node": "split_text_forms", "status": "success"}],
                 "all_forms_text": document_text
             }
 
@@ -248,7 +245,7 @@ class NodesHelper:
             return {
                 'text_with_requirements': document_text,
                 "all_forms": [],
-                "error_log": {"split_text_forms": "success"},
+                "error_log": [{"node": "split_text_forms", "status": "success"}],
                 "all_forms_text": ''
             }
 
@@ -276,29 +273,28 @@ class NodesHelper:
         all_forms_text = state['all_forms_text']
         prompt = create_prompt_forms_markup(document=all_forms_text)
         response = await limited_invoke_gigachat(prompt, node_name="generate_forms_markup")
-        log = state.get("error_log", {"generate_forms_markup": "success"})
 
         # Используем safe_parse_json вместо json.loads
         markup_dict = safe_parse_json(response.content, node_name="generate_forms_markup")
 
         if markup_dict is None:
-            log = {"generate_forms_markup": "Ошибка создания словаря с разметкой"}
             logger.error("[generate_forms_markup] Failed to parse markup JSON")
             return {
                 "forms_markup": {"start": [], "end": [], "classification": []},
-                "error_log": log
+                "error_log": [{"node": "generate_forms_markup", "error": "Ошибка создания словаря с разметкой"}]
             }
 
         if not markup_dict:
             logger.warning("[generate_forms_markup] Empty markup")
             return {
-                "forms_markup": {'start': [], 'end': [], 'classification': []}
+                "forms_markup": {'start': [], 'end': [], 'classification': []},
+                "error_log": [{"node": "generate_forms_markup", "status": "empty_markup"}]
             }
 
         logger.info(f"[generate_forms_markup] Completed ({time.time() - start_time:.2f}s) | forms={len(markup_dict.get('start', []))}")
         return {
             "forms_markup": markup_dict,
-            "error_log": log
+            "error_log": [{"node": "generate_forms_markup", "status": "success"}]
         }
 
     @staticmethod
@@ -310,7 +306,7 @@ class NodesHelper:
         all_forms = state['all_forms']
         res_list = []
         need_forms = []
-        log = {}
+        errors = []
         starts = markup.get('start', [])
         ends = markup.get('end', [])
         classification = markup.get('classification', [])
@@ -322,7 +318,7 @@ class NodesHelper:
                 logger.info(f"[extract_forms] Form {num} extracted: '{st[:30]}' -> '{en[:30]}'")
                 num += 1
             except Exception as e:
-                log[f"form_{num}"] = f"Ошибка при извлечении формы: {e}"
+                errors.append({"node": "extract_forms", "error": f"Form {num}: {e}"})
                 logger.warning(f"[extract_forms] Form {num} failed: {e}")
                 res_list.append([])
                 num += 1
@@ -333,9 +329,9 @@ class NodesHelper:
                 need_forms.append((form, label))
 
         logger.info(f"[extract_forms] Completed ({time.time() - start_time:.2f}s) | total={len(res_list)} | needed={len(need_forms)}")
-        if log:
-            return {"individual_forms": need_forms, "error_log": log}
-        return {"individual_forms": need_forms}
+        if errors:
+            return {"individual_forms": need_forms, "error_log": errors}
+        return {"individual_forms": need_forms, "error_log": [{"node": "extract_forms", "status": "success"}]}
 
     @staticmethod
     def check_for_forms(state):
@@ -347,7 +343,10 @@ class NodesHelper:
 
     @staticmethod
     async def prepare_fill_forms(state: Statement):
-        """Заполнение форм данными банка"""
+        """
+        Заполнение форм данными банка.
+        Параллельный вызов LLM для всех форм через asyncio.gather.
+        """
         logger.info("[prepare_fill_forms] Started")
         start_time = time.time()
         try:
@@ -363,17 +362,32 @@ class NodesHelper:
                                                           "согласие": create_prompt_fill_form_soglasie(document=x.form_text, data=x.forms_data)
                                                       }.get(x.label, "в ответ выведи только \"форма не заполнена\""), axis=1
                                                       )
-            filled = []
 
+            # Параллельный вызов LLM для всех форм
+            tasks = []
             for idx, prompt in enumerate(forms_frame['prompt']):
-                logger.info(f"[prepare_fill_forms] Filling form {idx} (label={forms_frame['label'].iloc[idx]})")
-                response = await limited_invoke_gigachat(prompt, node_name="prepare_fill_forms")
-                filled.append(response.content)
+                logger.info(f"[prepare_fill_forms] Scheduling form {idx} (label={forms_frame['label'].iloc[idx]})")
+                tasks.append(limited_invoke_gigachat(prompt, node_name=f"prepare_fill_forms[{idx}]"))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            filled = []
+            fill_errors = []
+            for idx, result in enumerate(results):
+                if isinstance(result, BaseException):
+                    logger.error(f"[prepare_fill_forms] Form {idx} LLM failed: {result}")
+                    filled.append("")
+                    fill_errors.append({"node": "prepare_fill_forms", "error": f"Form {idx}: {result}"})
+                else:
+                    filled.append(result.content)
+
             forms_frame['dict_form'] = filled
 
             # Валидация и ремонт JSON для каждой формы
             for idx in range(len(forms_frame)):
                 raw = forms_frame['dict_form'].iloc[idx]
+                if not raw:
+                    continue
                 parsed = safe_parse_json(raw, node_name="prepare_fill_forms")
                 if parsed is not None:
                     forms_frame.at[forms_frame.index[idx], 'dict_form'] = json.dumps(parsed, ensure_ascii=False)
@@ -382,25 +396,55 @@ class NodesHelper:
                     logger.warning(f"[prepare_fill_forms] Form {idx}: JSON parse failed, keeping raw")
 
         except Exception as e:
-            log = {"fill_forms": f"Ошибка во время создания датафрейма для заполнения форм {e}"}
             logger.error(f"[prepare_fill_forms] Error: {e}")
-            return {"error_log": log}
+            return {"error_log": [{"node": "prepare_fill_forms", "error": str(e)}]}
 
         forms_frame = forms_frame[
             ~(forms_frame['dict_form'].fillna('').astype(str).str.lower().str.contains("форма не заполнена", na=False)) &
             ~(forms_frame['dict_form'].fillna('').astype(str).str.lower().str.contains(r"\{\}", na=False, regex=True))
             ]
 
+        log_entries = fill_errors if fill_errors else [{"node": "prepare_fill_forms", "status": "success"}]
         logger.info(f"[prepare_fill_forms] Completed ({time.time() - start_time:.2f}s) | forms_to_fill={len(forms_frame)}")
-        return {"forms_frame": forms_frame[["forms", "dict_form", "label"]].rename({"forms": "bytes", "dict_form": "dictionary", "label": "name"}, axis=1)}
+        return {
+            "forms_frame": forms_frame[["forms", "dict_form", "label"]].rename({"forms": "bytes", "dict_form": "dictionary", "label": "name"}, axis=1),
+            "error_log": log_entries
+        }
 
     @staticmethod
     def combine_answer(state: Statement) -> dict:
-        """Агрегация ответа"""
+        """Агрегация ответа — defensive, собирает частичный результат если одна ветка упала"""
         logger.info("[combine_answer] Started")
-        forms_frame = state.get("filled_forms_frame", pd.DataFrame({"filled_bytes": None, "name": None, "dictionary": None, "text_filled": None}, index=[0]))
-        requirements = state.get("reducer_list_req", "")
-        return {"answer": {"form_dict": "%%%".join([str(x) for x in list(forms_frame['text_filled'])]), "requirements": requirements}}
+        errors = []
+
+        # Forms branch — defensive
+        form_dict_str = ""
+        try:
+            forms_frame = state.get("filled_forms_frame")
+            if forms_frame is not None and not forms_frame.empty and "text_filled" in forms_frame.columns:
+                form_dict_str = "%%%".join([str(x) for x in list(forms_frame['text_filled'])])
+            else:
+                logger.warning("[combine_answer] Forms branch: no filled forms available")
+                errors.append({"node": "combine_answer", "error": "Forms branch returned no data"})
+        except Exception as e:
+            logger.error(f"[combine_answer] Forms branch error: {e}")
+            errors.append({"node": "combine_answer", "error": f"Forms aggregation failed: {e}"})
+
+        # Requirements branch — defensive
+        requirements = ""
+        try:
+            requirements = state.get("reducer_list_req", "")
+            if not requirements:
+                logger.warning("[combine_answer] Requirements branch: empty result")
+        except Exception as e:
+            logger.error(f"[combine_answer] Requirements branch error: {e}")
+            errors.append({"node": "combine_answer", "error": f"Requirements aggregation failed: {e}"})
+
+        result = {"answer": {"form_dict": form_dict_str, "requirements": requirements}}
+        if errors:
+            result["error_log"] = errors
+        logger.info(f"[combine_answer] Completed | forms={'yes' if form_dict_str else 'no'} | requirements={'yes' if requirements else 'no'}")
+        return result
 
     @staticmethod
     def fill_forms(state: Statement) -> dict:
@@ -414,12 +458,65 @@ class NodesHelper:
                 forms_frame['filled_bytes'] = forms_frame.apply(filler.fill_and_save, axis=1)
                 forms_frame['text_filled'] = forms_frame['filled_bytes'].apply(lambda x: DocumentProcessingHelpers(x).extract_text())
                 logger.info(f"[fill_forms] Completed ({time.time() - start_time:.2f}s) | filled={len(forms_frame)}")
-                return {"filled_forms_frame": forms_frame, "error_log": {"fill_forms": "success"}}
+                return {"filled_forms_frame": forms_frame, "error_log": [{"node": "fill_forms", "status": "success"}]}
             except Exception as e:
                 empty_frame = pd.DataFrame({"filled_bytes": None, "name": None, "dictionary": None, "text_filled": None}, index=[0])
-                log = {"fill_forms": f"Ошибка при заполнении форм: {e}"}
                 logger.error(f"[fill_forms] Error: {e}")
-                return {"error_log": log, "filled_forms_frame": empty_frame}
+                return {"error_log": [{"node": "fill_forms", "error": str(e)}], "filled_forms_frame": empty_frame}
+
+    @staticmethod
+    def validate_filled_forms(state: Statement) -> dict:
+        """
+        Валидация заполненных форм перед отправкой в ECM.
+        Проверяет: документ читаемый, не пустой, содержит заполненные данные.
+        Отфильтровывает битые формы с записью в error_log.
+        """
+        logger.info("[validate_filled_forms] Started")
+        start_time = time.time()
+        forms_frame = state.get("filled_forms_frame")
+        errors = []
+
+        if forms_frame is None or forms_frame.empty:
+            logger.warning("[validate_filled_forms] No forms to validate")
+            return {"error_log": [{"node": "validate_filled_forms", "status": "no_forms"}]}
+
+        rows_to_drop = []
+        for idx, row in forms_frame.iterrows():
+            try:
+                filled_bytes = row.get("filled_bytes")
+                if filled_bytes is None:
+                    rows_to_drop.append(idx)
+                    errors.append({"node": "validate_filled_forms", "error": f"Form {idx}: filled_bytes is None"})
+                    continue
+
+                # Проверка что docx читается
+                from io import BytesIO
+                from docx import Document
+                doc = Document(BytesIO(bytes(filled_bytes)))
+                text = "\n".join(p.text for p in doc.paragraphs)
+
+                if len(text.strip()) < 50:
+                    rows_to_drop.append(idx)
+                    errors.append({"node": "validate_filled_forms", "error": f"Form {idx}: too short ({len(text.strip())} chars)"})
+                    logger.warning(f"[validate_filled_forms] Form {idx} too short: {len(text.strip())} chars")
+                    continue
+
+            except Exception as e:
+                rows_to_drop.append(idx)
+                errors.append({"node": "validate_filled_forms", "error": f"Form {idx}: {e}"})
+                logger.error(f"[validate_filled_forms] Form {idx} failed validation: {e}")
+
+        if rows_to_drop:
+            validated_frame = forms_frame.drop(rows_to_drop)
+            logger.info(f"[validate_filled_forms] Dropped {len(rows_to_drop)} invalid forms")
+        else:
+            validated_frame = forms_frame
+
+        if not errors:
+            errors = [{"node": "validate_filled_forms", "status": "success"}]
+
+        logger.info(f"[validate_filled_forms] Completed ({time.time() - start_time:.2f}s) | valid={len(validated_frame)}/{len(forms_frame)}")
+        return {"filled_forms_frame": validated_frame, "error_log": errors}
 
     @staticmethod
     async def react_agent(state: Statement) -> dict:

@@ -1,9 +1,11 @@
 """
 Здесь расположены Pydantic модели для описания ответов, тел запросов, возвращаемых ошибок и т.д.
 """
+import operator
+from typing import Annotated, List, Literal, Tuple, TypedDict
+
 from pandas import DataFrame
 from pydantic import BaseModel, Field
-from typing import List, TypedDict, Literal, Tuple
 
 # =====================================================================================================================
 # СХЕМЫ ДЛЯ РОУТЕРА retrieve-contents-multipart
@@ -99,7 +101,7 @@ class Statement(TypedDict):
     filled_forms_frame: DataFrame
 
     #logs
-    error_log: dict
+    error_log: Annotated[list[dict], operator.add]
 
     #all_requirements 2 step
     all_requirements: str

@@ -26,6 +26,7 @@ async def main(state: Statement):
     graph.add_node("skip_node", nodes.skip_node)
     graph.add_node("combine_answer", nodes.combine_answer)
     graph.add_node("fill_forms", nodes.fill_forms)
+    graph.add_node("validate_filled_forms", nodes.validate_filled_forms)
     graph.add_node("save_data_ecm", nodes.save_data_in_ecm)
 
     # left nodes
@@ -42,7 +43,8 @@ async def main(state: Statement):
     graph.add_edge("markup", "extract_forms")
     graph.add_conditional_edges("extract_forms", nodes.check_forms, {False: "combine_answer", True: "prepare_fill_forms"})
     graph.add_edge("prepare_fill_forms", "fill_forms")
-    graph.add_edge("fill_forms", "save_data_ecm")
+    graph.add_edge("fill_forms", "validate_filled_forms")
+    graph.add_edge("validate_filled_forms", "save_data_ecm")
     graph.add_edge("save_data_ecm", "combine_answer")
 
     # left branch
