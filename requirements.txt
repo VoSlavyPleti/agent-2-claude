@@ -32,6 +32,7 @@ iniconfig==2.1.0
 isort==5.13.2
 joblib==1.5.1
 jsonpatch==1.33
+json-repair>=0.30.0
 jsonpointer==3.0.0
 langchain~=0.3.27
 langchain-community==0.3.24

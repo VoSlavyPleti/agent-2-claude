@@ -14,7 +14,7 @@ logger = APP_CTX.get_logger()
 
 class DocumentProcessingHelpers:
     """Класс для помощи в обработке документов"""
-    
+
     """
     Основные методы:
         extract_text: Извлечение текста документа из байтового массива
@@ -29,7 +29,7 @@ class DocumentProcessingHelpers:
         self.doc = Document(BytesIO(bitt))
 
     def _contains_text_forms(self, element, text):
-        """Проверка наличия регулярного выражения в тексте элемента"""
+        """Проверка наличия текста в элементе (fuzzy-matching через _clear_text)"""
         if isinstance(element, Paragraph):
             return self._clear_text(text) in self._clear_text(element.text)
         elif isinstance(element, Table):
@@ -40,7 +40,7 @@ class DocumentProcessingHelpers:
         return False
 
     def _clear_text(self, text):
-        """Отчистка текста от всего кроме букв"""
+        """Очистка текста от всего кроме букв и цифр"""
         text = text.lower()
         text = text.strip()
         text = re.sub(r'\s+', ' ', text)
@@ -228,10 +228,19 @@ class DocumentProcessingHelpers:
         return list(byte_array)
 
 class FormFiller:
+    """
+    Заполнение форм данными.
+
+    Улучшения:
+    - Работа на уровне run'ов для сохранения форматирования (шрифт, размер, жирность)
+    - Улучшенный поиск пропусков в соседних run'ах
+    - Копирование стилей при заполнении таблиц
+    - Лучшая обработка ошибок с логированием
+    """
 
     @staticmethod
     def _clear_text(text):
-        """Отчистка текста от всего кроме букв"""
+        """Очистка текста от всего кроме букв и цифр"""
         text = text.lower()
         text = text.strip()
         text = re.sub(r'\s+', ' ', text)
@@ -240,101 +249,78 @@ class FormFiller:
 
     @staticmethod
     def copy_styles(current_cell, previous_cell):
-        """Функция для применения стилей с предыдущего параграфа на текущий (новый добавленный)"""
+        """Копирование стилей из предыдущего параграфа/ячейки в текущую"""
         if current_cell and previous_cell:
-            current_cell.style = previous_cell.style
-            source_font = previous_cell.runs[0].font
-            target_font = current_cell.runs[-1].font
+            try:
+                current_cell.style = previous_cell.style
+                if previous_cell.runs and current_cell.runs:
+                    source_font = previous_cell.runs[0].font
+                    target_font = current_cell.runs[-1].font
 
-            # Переносим атрибуты шрифта
-            target_font.name = source_font.name
-            target_font.size = source_font.size
-            # target_font.bold = source_font.bold
-            target_font.italic = source_font.italic
-            target_font.underline = source_font.underline
-            target_font.color.rgb = source_font.color.rgb
+                    target_font.name = source_font.name
+                    target_font.size = source_font.size
+                    target_font.italic = source_font.italic
+                    target_font.underline = source_font.underline
+                    if source_font.color and source_font.color.rgb:
+                        target_font.color.rgb = source_font.color.rgb
+            except Exception as e:
+                logger.warning(f"[FormFiller] Failed to copy styles: {e}")
+
+    @staticmethod
+    def _fill_run_with_value(run, value, pattern=r'_+'):
+        """
+        Заполнение run'а значением, заменяя подчёркивания.
+        Сохраняет форматирование run'а.
+        """
+        run.text = re.sub(pattern, f' {value}', run.text, count=1)
+
+    @staticmethod
+    def _find_underscore_run(paragraph, start_run_index=0):
+        """
+        Найти первый run с подчёркиваниями начиная с указанного индекса.
+        Возвращает индекс run'а или -1.
+        """
+        pattern = r'_+'
+        for i in range(start_run_index, len(paragraph.runs)):
+            if re.findall(pattern, paragraph.runs[i].text):
+                return i
+        return -1
 
     def fill_and_save(self, row):
-        """Заполнение форм данными из сформированного в prepare_fill_forms словаря"""
+        """
+        Заполнение форм данными из сформированного в prepare_fill_forms словаря.
+
+        Работает на уровне run'ов для максимального сохранения форматирования.
+        """
         doc = Document(BytesIO(bytes(row.bytes)))
         data = json.loads(row.dictionary)
-        # отсортируем ключи, чтобы длинные искались первыми
         pattern = r'_+'
+        filled_count = 0
+        failed_count = 0
 
         for key, (ptype, value) in data.items():
+            try:
+                if ptype == "Текст до":
+                    filled = self._fill_text_before(doc, key, value, pattern)
+                elif ptype == "Текст после":
+                    filled = self._fill_text_after(doc, key, value, pattern)
+                elif ptype == "Таблица":
+                    filled = self._fill_table(doc, key, value)
+                elif ptype == "Гибрид":
+                    filled = self._fill_hybrid(doc, key, value, pattern)
+                else:
+                    filled = False
 
-            if ptype == "Текст до":
-                for paragraph in doc.paragraphs:
-                    if self._clear_text(key) in self._clear_text(paragraph.text):  # Поиск ключа в тексте параграфа, далее поиск по ранам
-                        for run_number, run in enumerate(paragraph.runs):
-                            if self._clear_text(key) in self._clear_text(run.text):
-                                key_index = self._clear_text(run.text).find(self._clear_text(key))
-                                run_text_full = run.text
-                                run_text_slice = run_text_full[key_index+len(key):]
+                if filled:
+                    filled_count += 1
+                else:
+                    failed_count += 1
+            except Exception as e:
+                logger.warning(f"[FormFiller] Failed to fill '{key[:30]}' (type={ptype}): {e}")
+                failed_count += 1
+                continue
 
-                                if re.findall(pattern, run_text_slice):
-                                    run_text_slice = re.sub(pattern, f' {value}', run_text_slice, count=1)
-                                    run.text = run_text_full[:key_index+len(key)] + run_text_slice
-                                else:
-                                    iter_index = 1
-                                    try:
-                                        while not re.findall(pattern, paragraph.runs[run_number+iter_index].text):
-                                            iter_index += 1
-                                        run_text_next = re.sub(pattern, f' {value}', paragraph.runs[run_number+iter_index].text, count=1)
-                                        paragraph.runs[run_number+iter_index].text = run_text_next
-                                    except IndexError as e:
-                                        continue
-                            elif self._clear_text(run.text) in self._clear_text(key) and run.text.strip():
-                                if re.findall(self._clear_text(paragraph.runs[run_number+1].text), self._clear_text(key)):
-                                    continue
-                                iter_index = 1
-                                try:
-                                    while not re.findall(pattern, paragraph.runs[run_number+iter_index].text):
-                                        iter_index += 1
-                                    run_text_next = re.sub(pattern, f' {value}', paragraph.runs[run_number+iter_index].text, count=1)
-                                    paragraph.runs[run_number+iter_index].text = run_text_next
-                                except IndexError as e:
-                                    continue
-            elif ptype == "Текст после":
-                for paragraph_number, paragraph in enumerate(doc.paragraphs):
-                    if self._clear_text(key) in self._clear_text(paragraph.text):
-                        to_replace_paragraph = doc.paragraphs[paragraph_number-1]
-                        for run in to_replace_paragraph.runs[::-1]:
-                            run_text = run.text
-                            if re.findall(pattern, run_text):
-                                run_text = re.sub(pattern, value, run_text, count=1)
-                                print(run_text)
-                                run.text = run_text
-                                break
-            elif ptype == "Таблица":
-                for table in doc.tables:
-                    for row in table.rows:
-                        for num, cell in enumerate(row.cells):
-                            if self._clear_text(key) in self._clear_text(cell.text):
-                                try:  # Для отлавливания IndexError, если не будет пустой ячейки
-                                    filling_cell = row.cells[num+1]
-                                    if filling_cell.text.strip():
-                                        filling_cell.paragraphs[-1].runs[-1].text += "\n" + value
-                                    else:
-                                        filling_cell.text = str(value)
-                                    self.copy_styles(filling_cell.paragraphs[-1], cell.paragraphs[-1])
-                                except IndexError as e:
-                                    cell.add_paragraph()
-                                    cell.paragraphs[-1].text = value
-                                    self.copy_styles(cell.paragraphs[-1], cell.paragraphs[0])
-            elif ptype == "Гибрид":
-                for table in doc.tables:
-                    for row in table.rows:
-                        for num, cell in enumerate(row.cells):
-                            if self._clear_text(key) in self._clear_text(cell.text) and re.findall(pattern, cell.text):
-                                cell.text = re.sub(pattern, f" {value}", cell.text, count = 1)
-                            elif self._clear_text(key) in self._clear_text(cell.text) and not re.findall(pattern, cell.text):
-                                try:
-                                    next_cell = row.cells[num+1]
-                                    next_cell.text = re.sub(pattern, f" {value}", next_cell.text, count=1)
-                                    break
-                                except IndexError as e:
-                                    continue
+        logger.info(f"[FormFiller] Form filled: {filled_count} ok, {failed_count} failed, total={len(data)}")
 
         self.replace_last_table_with_podpis(doc)
         buffer = BytesIO()
@@ -343,6 +329,147 @@ class FormFiller:
         buffer.close()
         return list(byte_array)
 
+    def _fill_text_before(self, doc, key, value, pattern):
+        """
+        Тип 'Текст до': ключевое слово перед пропуском ____ в том же параграфе.
+        Работает на уровне run'ов.
+        """
+        for paragraph in doc.paragraphs:
+            if self._clear_text(key) in self._clear_text(paragraph.text):
+                for run_number, run in enumerate(paragraph.runs):
+                    if self._clear_text(key) in self._clear_text(run.text):
+                        key_index = self._clear_text(run.text).find(self._clear_text(key))
+                        run_text_full = run.text
+                        run_text_slice = run_text_full[key_index + len(key):]
+
+                        if re.findall(pattern, run_text_slice):
+                            run_text_slice = re.sub(pattern, f' {value}', run_text_slice, count=1)
+                            run.text = run_text_full[:key_index + len(key)] + run_text_slice
+                            return True
+                        else:
+                            # Ищем подчёркивания в следующих run'ах
+                            iter_index = 1
+                            try:
+                                while not re.findall(pattern, paragraph.runs[run_number + iter_index].text):
+                                    iter_index += 1
+                                target_run = paragraph.runs[run_number + iter_index]
+                                target_run.text = re.sub(pattern, f' {value}', target_run.text, count=1)
+                                return True
+                            except IndexError:
+                                continue
+                    elif self._clear_text(run.text) in self._clear_text(key) and run.text.strip():
+                        try:
+                            if re.findall(self._clear_text(paragraph.runs[run_number + 1].text), self._clear_text(key)):
+                                continue
+                        except IndexError:
+                            pass
+                        iter_index = 1
+                        try:
+                            while not re.findall(pattern, paragraph.runs[run_number + iter_index].text):
+                                iter_index += 1
+                            target_run = paragraph.runs[run_number + iter_index]
+                            target_run.text = re.sub(pattern, f' {value}', target_run.text, count=1)
+                            return True
+                        except IndexError:
+                            continue
+        return False
+
+    def _fill_text_after(self, doc, key, value, pattern):
+        """
+        Тип 'Текст после': ключевое слово в скобках после пропуска ____.
+        Ищем в предыдущем параграфе.
+        """
+        for paragraph_number, paragraph in enumerate(doc.paragraphs):
+            if self._clear_text(key) in self._clear_text(paragraph.text):
+                if paragraph_number > 0:
+                    to_replace_paragraph = doc.paragraphs[paragraph_number - 1]
+                    for run in to_replace_paragraph.runs[::-1]:
+                        run_text = run.text
+                        if re.findall(pattern, run_text):
+                            run.text = re.sub(pattern, value, run_text, count=1)
+                            return True
+        return False
+
+    def _fill_table(self, doc, key, value):
+        """
+        Тип 'Таблица': ключ в ячейке таблицы, значение в соседней (правой) ячейке.
+        Работает на уровне run'ов для сохранения форматирования.
+        """
+        for table in doc.tables:
+            for row in table.rows:
+                for num, cell in enumerate(row.cells):
+                    if self._clear_text(key) in self._clear_text(cell.text):
+                        try:
+                            filling_cell = row.cells[num + 1]
+                            if filling_cell.text.strip():
+                                # Ячейка не пустая — добавляем через run
+                                if filling_cell.paragraphs[-1].runs:
+                                    filling_cell.paragraphs[-1].runs[-1].text += "\n" + value
+                                else:
+                                    filling_cell.paragraphs[-1].add_run("\n" + value)
+                            else:
+                                # Ячейка пустая — заполняем через run для сохранения стилей
+                                if filling_cell.paragraphs and filling_cell.paragraphs[0].runs:
+                                    filling_cell.paragraphs[0].runs[0].text = str(value)
+                                else:
+                                    new_run = filling_cell.paragraphs[0].add_run(str(value))
+                                    # Копируем стиль шрифта из ячейки-ключа
+                                    if cell.paragraphs and cell.paragraphs[-1].runs:
+                                        src_font = cell.paragraphs[-1].runs[0].font
+                                        new_run.font.name = src_font.name
+                                        new_run.font.size = src_font.size
+                            self.copy_styles(filling_cell.paragraphs[-1], cell.paragraphs[-1])
+                            return True
+                        except IndexError:
+                            cell.add_paragraph()
+                            cell.paragraphs[-1].text = value
+                            self.copy_styles(cell.paragraphs[-1], cell.paragraphs[0])
+                            return True
+        return False
+
+    def _fill_hybrid(self, doc, key, value, pattern):
+        """
+        Тип 'Гибрид': ключ и ____ в одной ячейке таблицы.
+        Работает на уровне run'ов.
+        """
+        for table in doc.tables:
+            for row in table.rows:
+                for num, cell in enumerate(row.cells):
+                    if self._clear_text(key) in self._clear_text(cell.text) and re.findall(pattern, cell.text):
+                        # Подчёркивания в той же ячейке что и ключ
+                        # Ищем run с подчёркиваниями
+                        filled = False
+                        for para in cell.paragraphs:
+                            for run in para.runs:
+                                if re.findall(pattern, run.text):
+                                    run.text = re.sub(pattern, f" {value}", run.text, count=1)
+                                    filled = True
+                                    break
+                            if filled:
+                                break
+                        if not filled:
+                            # Fallback: замена через cell.text (менее безопасно)
+                            cell.text = re.sub(pattern, f" {value}", cell.text, count=1)
+                        return True
+                    elif self._clear_text(key) in self._clear_text(cell.text) and not re.findall(pattern, cell.text):
+                        try:
+                            next_cell = row.cells[num + 1]
+                            # Ищем run с подчёркиваниями в соседней ячейке
+                            filled = False
+                            for para in next_cell.paragraphs:
+                                for run in para.runs:
+                                    if re.findall(pattern, run.text):
+                                        run.text = re.sub(pattern, f" {value}", run.text, count=1)
+                                        filled = True
+                                        break
+                                if filled:
+                                    break
+                            if not filled:
+                                next_cell.text = re.sub(pattern, f" {value}", next_cell.text, count=1)
+                            return True
+                        except IndexError:
+                            continue
+        return False
 
     def replace_last_table_with_podpis(self, doc):
         tables_with_podpis = []
@@ -377,9 +504,8 @@ class FormFiller:
                         elif "___" in doc.paragraphs[num - 1].text:
                             to_remove.append((num, doc.paragraphs[num]._element))
                             to_remove.append((num + 1, doc.paragraphs[num + 1]._element))
-                    except IndexError as e:
+                    except IndexError:
                         pass
-                print(to_remove)
 
                 target_paragraph = paragraphs_with_podpis[-1][1]
                 new_table = self.create_signature_table(doc)
