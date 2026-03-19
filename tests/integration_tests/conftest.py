@@ -1,0 +1,15 @@
+import asyncio
+import pytest
+
+
+@pytest.fixture(scope="session")
+def event_loop(request):
+    """Create an instance of the default event loop for each test case."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+
+pytest_plugins = [
+    "fixtures.fixture_v1_client_session",
+]

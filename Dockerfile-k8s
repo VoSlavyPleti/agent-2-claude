@@ -1,0 +1,69 @@
+FROM sberosc.sigma.sbrf.ru/docker.io/python:3.11-alpine as base
+
+ENV TZ=Europe/Moscow \
+    LC_ALL=en_US.UTF-8 \
+	LANG=en_US.UTF-8
+
+ENV PATH=$HOME/.local/bin/:$PATH \
+    HOME=/app \
+    CERTSDIR=/opt/certs
+
+ENV PYTHONFAULTHANDLER=1 \
+    PYTHONHASHSEED=random \
+    PYTHONUNBUFFERED=1
+
+
+ENV POETRY_HOME=/opt/poetry \
+    POETRY_VENV=/opt/poetry-venv
+
+########################### Builder ############################
+FROM base as builder
+
+ARG SBEROSC_TOKEN
+ARG DOWNLOAD_CERT_PATH="https://nexus.sigma.sbrf.ru/nexus/content/repositories/OAIR_tool_release/cert"
+
+RUN mkdir $CERTSDIR
+ENV CA_CERT=$CERTSDIR/sberca-chain.pem
+ENV POETRY_REQUESTS_TIMEOUT=100
+
+# APK installation settings
+RUN sed -i 's/https/http/' /etc/apk/repositories
+RUN apk add curl
+
+# Auth sber mirrors ca certs
+RUN curl -kv $DOWNLOAD_CERT_PATH/cacert_sigma.pem -o $CA_CERT
+RUN cat $CA_CERT
+ENV PIP_CERT=$CA_CERT \
+    PIP_DEFAULT_TIMEOUT=100 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL="https://token:${SBEROSC_TOKEN}@sberosc.sigma.sbrf.ru/repo/pypi/simple" \
+    POETRY_VERSION=1.6.0
+
+# Install poetry separated from system interpreter
+RUN python3 -m venv ${POETRY_VENV} \
+    && ${POETRY_VENV}/bin/pip install -U pip setuptools \
+    && ${POETRY_VENV}/bin/pip install poetry>=${POETRY_VERSION}
+
+# Add `poetry` to PATH
+ENV PATH="${PATH}:${POETRY_VENV}/bin"
+
+WORKDIR ${HOME}
+
+COPY poetry.lock pyproject.toml ./
+
+COPY src/ ./src/
+
+RUN poetry check
+RUN poetry build && ${POETRY_VENV}/bin/pip install dist/*.whl
+
+########################### Финальный образ ############################
+FROM base as final
+
+ENV PATH="${PATH}:${POETRY_VENV}/bin"
+
+WORKDIR ${HOME}
+
+COPY --from=builder ${POETRY_VENV} ${POETRY_VENV}
+
+ENTRYPOINT ["aigw-rest-service-sh"]
+EXPOSE 8080
